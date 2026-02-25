@@ -1,0 +1,18 @@
+# Environnement virtuel
+.venv/
+
+# IDE
+.idea/
+
+# Cache Python
+__pycache__/
+*.pyc
+
+# Modèles entraînés (trop lourds pour Git)
+*.pth
+
+# Images générées
+*.png
+
+# Checkpoints
+checkpoint_*.pth
