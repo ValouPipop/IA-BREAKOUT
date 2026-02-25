@@ -22,6 +22,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # ★ Backend sans écran (pour VM headless en SSH)
 import matplotlib.pyplot as plt
 from collections import deque
 import cv2
