@@ -289,8 +289,8 @@ def compute_returns(rewards: list, dones: list, gamma: float) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 # 4.  MISE À JOUR DU MODÈLE (fonction utilitaire)
 # ─────────────────────────────────────────────────────────────────────────────
-MAX_BATCH_SIZE = 64   # ★ Taille max de mini-batch pour gradient accumulation
-                      #   Réduit à 64 pour IMPALA (15 couches = beaucoup d'activations)
+MAX_BATCH_SIZE = 256  # ★ Taille max de mini-batch pour gradient accumulation
+                      #   256 pour exploiter les 24 Go VRAM du L4
 
 
 def update_model(model, optimizer, states, actions, rewards, dones):
