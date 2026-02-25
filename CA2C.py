@@ -289,14 +289,17 @@ def compute_returns(rewards: list, dones: list, gamma: float) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 # 4.  MISE À JOUR DU MODÈLE (fonction utilitaire)
 # ─────────────────────────────────────────────────────────────────────────────
-MAX_BATCH_SIZE = 128  # ★ Taille max de mini-batch pour le forward pass
-                      #   Évite les OOM sur GPU avec peu de VRAM (ex: 6 Go)
+MAX_BATCH_SIZE = 64   # ★ Taille max de mini-batch pour gradient accumulation
+                      #   Réduit à 64 pour IMPALA (15 couches = beaucoup d'activations)
 
 
 def update_model(model, optimizer, states, actions, rewards, dones):
     """
     Effectue UNE mise à jour A2C sur un segment de trajectoire.
-    ★ Le forward pass est découpé en mini-batches pour éviter l'OOM GPU.
+    ★ GRADIENT ACCUMULATION : forward + backward par mini-batch pour
+      borner la VRAM indépendamment de la longueur de l'épisode.
+      Chaque mini-batch calcule sa perte partielle, fait backward()
+      (les gradients s'accumulent), puis on fait UN SEUL optimizer.step().
     Retourne un dict avec les métriques détaillées, ou None si segment trop court.
     """
     if len(rewards) < 2:
@@ -310,52 +313,77 @@ def update_model(model, optimizer, states, actions, rewards, dones):
     states_np = np.array(states)
     actions_t = torch.LongTensor(actions).to(DEVICE)
 
-    # ── Forward pass en mini-batches pour économiser la VRAM ─────────────
-    #   On découpe le batch en morceaux de MAX_BATCH_SIZE.
-    #   Chaque morceau est envoyé au GPU, passé dans le modèle, puis
-    #   les résultats sont concaténés. Cela borne l'utilisation de VRAM
-    #   indépendamment de la longueur de l'épisode.
     n = len(states)
-    logits_chunks = []
-    values_chunks = []
+    n_chunks = (n + MAX_BATCH_SIZE - 1) // MAX_BATCH_SIZE  # nombre de mini-batches
 
-    for i in range(0, n, MAX_BATCH_SIZE):
-        chunk = torch.FloatTensor(states_np[i:i+MAX_BATCH_SIZE]).to(DEVICE)
-        logits_c, values_c = model(chunk)
-        logits_chunks.append(logits_c)
-        values_chunks.append(values_c)
-
-    logits_all = torch.cat(logits_chunks, dim=0)
-    values_all = torch.cat(values_chunks, dim=0)
-
-    dist_all    = torch.distributions.Categorical(logits=logits_all)
-    log_probs_t = dist_all.log_prob(actions_t)
+    # ── Passe 1 : Forward sans gradient pour calculer les avantages ──────
+    #   On a besoin des valeurs V(st) pour calculer les avantages AVANT
+    #   de faire le vrai forward+backward. Cela ne consomme pas de VRAM
+    #   car no_grad() ne stocke pas les activations intermédiaires.
+    with torch.no_grad():
+        values_list = []
+        for i in range(0, n, MAX_BATCH_SIZE):
+            chunk = torch.FloatTensor(states_np[i:i+MAX_BATCH_SIZE]).to(DEVICE)
+            _, values_c = model(chunk)
+            values_list.append(values_c)
+        values_all = torch.cat(values_list, dim=0)
 
     # ── Avantage At = Rt − V(st) ────────────────────────────────────────
-    advantages = returns_t - values_all.detach()
+    advantages = returns_t - values_all
 
     # Normalisation des avantages → gradients plus stables
     if advantages.numel() > 1:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-    # ── Pertes ───────────────────────────────────────────────────────────
-    L_actor   = -(log_probs_t * advantages).mean()
-    L_critic  = ((returns_t - values_all) ** 2).mean()
-    L_entropy = dist_all.entropy().mean()
-
-    loss = L_actor + CV * L_critic - ENTROPY_COEF * L_entropy
-
-    # ── Mise à jour ──────────────────────────────────────────────────────
+    # ── Passe 2 : Gradient accumulation par mini-batch ───────────────────
+    #   Chaque mini-batch fait forward → loss → backward().
+    #   Les gradients s'ACCUMULENT dans model.parameters().grad.
+    #   À la fin, on fait UN SEUL optimizer.step().
     optimizer.zero_grad()
-    loss.backward()
+
+    total_loss = 0.0
+    total_actor = 0.0
+    total_critic = 0.0
+    total_entropy = 0.0
+
+    for i in range(0, n, MAX_BATCH_SIZE):
+        j = min(i + MAX_BATCH_SIZE, n)
+
+        chunk_states  = torch.FloatTensor(states_np[i:j]).to(DEVICE)
+        chunk_actions = actions_t[i:j]
+        chunk_returns = returns_t[i:j]
+        chunk_advs    = advantages[i:j]
+
+        logits, values = model(chunk_states)
+
+        dist      = torch.distributions.Categorical(logits=logits)
+        log_probs = dist.log_prob(chunk_actions)
+
+        # Pertes sur ce mini-batch
+        L_actor   = -(log_probs * chunk_advs.detach()).mean()
+        L_critic  = ((chunk_returns - values) ** 2).mean()
+        L_entropy = dist.entropy().mean()
+
+        # On divise par n_chunks pour que la somme des gradients
+        # = la moyenne globale (comme si on avait fait un seul gros batch)
+        chunk_loss = (L_actor + CV * L_critic - ENTROPY_COEF * L_entropy) / n_chunks
+        chunk_loss.backward()
+
+        # Métriques (pour l'affichage seulement)
+        total_loss    += chunk_loss.item() * n_chunks
+        total_actor   += L_actor.item()
+        total_critic  += L_critic.item()
+        total_entropy += L_entropy.item()
+
+    # ── UN SEUL step d'optimisation ──────────────────────────────────────
     nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
     optimizer.step()
 
     return {
-        "loss": loss.item(),
-        "L_actor": L_actor.item(),
-        "L_critic": L_critic.item(),
-        "entropy": L_entropy.item(),
+        "loss": total_loss / n_chunks,
+        "L_actor": total_actor / n_chunks,
+        "L_critic": total_critic / n_chunks,
+        "entropy": total_entropy / n_chunks,
         "seg_len": n,
     }
 
