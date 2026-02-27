@@ -1,15 +1,16 @@
 """
-PPO Vectorisé sur Atari Breakout
-=================================
-VERSION CORRIGÉE avec 8 environnements parallèles.
+PPO Vectorisé V2 sur Atari Breakout
+====================================
+VERSION AMÉLIORÉE : 16 envs, ROLLOUT 256, FC 512, 20M steps.
 
-Pourquoi multi-env ?
-  → PPO avec 1 seul env collecte 128 steps corrélés (même partie).
-  → Avec 8 envs, on collecte 8×128 = 1024 steps de 8 parties DIFFÉRENTES.
-  → Données plus variées → apprentissage BEAUCOUP plus rapide et stable.
-  → C'est le setup standard de TOUS les papiers de recherche.
+Améliorations par rapport à V1 (370 avg) :
+  → 16 environnements (au lieu de 8) = 2x plus de données variées
+  → ROLLOUT_LEN 256 (au lieu de 128) = trajectoires plus longues
+  → FC 512 (au lieu de 256) = plus de capacité de décision
+  → 20M timesteps (au lieu de 10M) = entraînement 2x plus long
+  → Objectif : 500+ de score moyen
 
-Architecture : IMPALA ResNet + PPO + GAE + 8 envs parallèles
+Architecture : IMPALA ResNet + PPO + GAE + 16 envs parallèles
 """
 
 import gymnasium as gym
@@ -37,11 +38,11 @@ CLIP_EPS     = 0.2           # Clipping [0.8, 1.2]
 CV           = 0.5           # Coeff perte critique
 ENTROPY_COEF = 0.01          # Coeff entropie
 GRAD_CLIP    = 0.5
-N_ENVS       = 8             # ★ 8 environnements parallèles
-ROLLOUT_LEN  = 128           # Steps par env par rollout (total: 8×128 = 1024)
+N_ENVS       = 16            # ★ 16 environnements parallèles (2x plus de diversité)
+ROLLOUT_LEN  = 256           # ★ Steps par env par rollout (total: 16×256 = 4096)
 PPO_EPOCHS   = 4             # Passes sur les mêmes données
-MINI_BATCH   = 256           # Mini-batch (sur les 1024 transitions)
-N_TIMESTEPS  = 10_000_000    # ~20K épisodes
+MINI_BATCH   = 512           # ★ Mini-batch (sur les 4096 transitions)
+N_TIMESTEPS  = 20_000_000    # ★ 20M steps (2x plus long)
 PRINT_EVERY  = 20
 SAVE_EVERY   = 500
 DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -124,9 +125,9 @@ class PPONet(nn.Module):
             in_ch = out_ch
 
         cnn_out_size = self._get_cnn_out(k_frames)
-        self.fc = nn.Sequential(nn.Linear(cnn_out_size, 256), nn.ReLU())
-        self.actor  = nn.Linear(256, n_actions)
-        self.critic = nn.Linear(256, 1)
+        self.fc = nn.Sequential(nn.Linear(cnn_out_size, 512), nn.ReLU())  # ★ 512 au lieu de 256
+        self.actor  = nn.Linear(512, n_actions)
+        self.critic = nn.Linear(512, 1)
         self._init_weights()
 
     def _init_weights(self):
@@ -565,7 +566,7 @@ def plot_results(episode_rewards, moving_avg):
             label="Moyenne glissante (100)")
     ax.set_xlabel("Évaluation")
     ax.set_ylabel("Récompense totale")
-    ax.set_title("PPO Vectorisé – Breakout-v5 (8 envs × IMPALA ResNet)")
+    ax.set_title("PPO Vectorisé V2 – Breakout-v5 (16 envs × IMPALA ResNet 512)")
     ax.legend()
     ax.grid(alpha=0.3)
     plt.tight_layout()
